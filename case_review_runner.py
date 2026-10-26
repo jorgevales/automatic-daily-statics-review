@@ -1021,6 +1021,10 @@ def initialise():
     }
     for label, path in paths.items():
         require_s(path, label).mkdir(parents=True, exist_ok=True)
+    # Windows stops at about 260 characters. The S: spelling is much shorter than the resolved network
+    # name, and the deep Playwright package files do not fit otherwise (pip: "No such file or directory").
+    paths = {label: Path('S:/') / require_s(path, label).relative_to(_S_ROOT) for label, path in paths.items()}
+    home = paths['home']
     for key, value in {**_ORIGINAL_EDGE_ENV, **_ORIGINAL_USER_ENV}.items():
         os.environ['DCR_ORIGINAL_' + key] = value
     env = {
@@ -1856,7 +1860,8 @@ _DIAG_STANDARD_ENV = {name.upper() for name in (
     'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_CONFIG_HOME', 'CHROME_LOG_FILE', 'CRASHPAD_DATABASE_PATH', 'DCR_PYTHON',
     'DCR_NODE', 'DCR_RUNTIME_ROOT', 'DCR_RUNNER', 'DCR_EXIT', 'NPM_CONFIG_CACHE', 'NPM_CONFIG_PREFIX', 'NODE_REPL_HISTORY')}
 _DIAG_URL = re.compile(r'https?://[^\s"\'<>)\]]+', re.I)
-_DIAG_PATH = re.compile(r'(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\[^\s\\/:*?"|<>]+[\\/])(?:[^\\/:*?"|\r\n]*[\\/])*[^\\/:*?"|\r\n]*')
+_DIAG_PATH = re.compile(r'(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\{2,}[^\s\\/:*?"|<>]+[\\/])(?:[^\\/:*?"|\r\n]*[\\/])*[^\\/:*?"|\r\n]*')
+_DIAG_MIDDLE_END = re.compile(r'[,;]\s|\s*->')
 _DIAG_TAIL_END = re.compile(r'\s+(?:is|was|are|were|not|must|does|do|could|cannot|can|failed|already|has|have|and|or|to|from|in|on|at|with|for|will|should|because|which|that)\b|[.,;]\s|\s*[(\[]|\s*->', re.I)
 _DIAG_EMAIL = re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+')
 _DIAG_RUN = re.compile(r'\brun-\d{8}-\d{6}-[0-9a-f]{8}\b')
@@ -1923,18 +1928,27 @@ class DiagSanitizer:
             return parts.scheme + '://' + host + (':' + str(port) if port else '') + keep + tail
         return self.label('URL', url, 'scheme=' + parts.scheme) + tail
 
+    def _cut(self, text, start, pattern, limit):
+        """Start of the first sentence-like break in text[start:limit] that is not inside a known name."""
+        pos = start
+        while True:
+            found = pattern.search(text, pos, limit)
+            if not found:
+                return None
+            if any(m.start() < found.start() < m.end() for _, v in self.known for m in re.finditer(re.escape(v), text, re.I)):
+                pos = found.end()
+                continue
+            return found.start()
+
     def _path(self, match):
         text = match.group(0)
-        pos = 3
-        while True:
-            end = _DIAG_TAIL_END.search(text, pos)
-            # A sentence word inside a known file or folder name is part of that name.
-            if end and any(m.start() < end.start() < m.end() for _, v in self.known
-                           for m in re.finditer(re.escape(v), text, re.I)):
-                pos = end.end()
-                continue
-            break
-        keep = text[:end.start()] if end else text
+        last = max(text.rfind('\\'), text.rfind('/'))
+        # Folder names may contain words like "and"; only punctuation ends a path before its last segment.
+        end = self._cut(text, 3, _DIAG_MIDDLE_END, last)
+        piece = text if end is None else text[:end]
+        # Words after the final separator of the piece belong to the sentence, not the file name.
+        tail = self._cut(piece, max(piece.rfind('\\'), piece.rfind('/')) + 1, _DIAG_TAIL_END, len(piece))
+        keep = piece if tail is None else piece[:tail]
         stripped = keep.rstrip(' .,;:')
         parts = [p for p in re.split(r'[\\/]+', stripped) if p]
         name = parts[-1] if parts else ''
@@ -2170,7 +2184,10 @@ def diag_proxy():
 
 def diag_env():
     plain = {'SESSIONNAME', 'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS', 'OS'}
-    return {name: (value if name in plain else Private(value)) for name, value in sorted(os.environ.items())}
+    standard = {n: v for n, v in sorted(os.environ.items()) if n.upper() in _DIAG_STANDARD_ENV}
+    custom = {n: v for n, v in sorted(os.environ.items()) if n.upper() not in _DIAG_STANDARD_ENV}
+    return {'standard_variable_names': list(standard), 'plain_values': {n: v for n, v in standard.items() if n in plain},
+            'standard_values': Private(standard), 'custom_variable_count': len(custom), 'custom_variables': Private(custom)}
 
 
 def diag_machine():
@@ -2315,6 +2332,9 @@ def diag_explain_edge(a):
 
 
 _DIAG_KNOWN_ERRORS = (
+    ('Long Path support', 'Windows refused a file path because it is too long (about 260 characters) while installing the Python packages on S:. '
+                          'Choose a shorter working folder (for example S:\\DCR): delete local_paths.cmd and run again. '
+                          'If it still fails, ask IT to enable Windows long paths.'),
     ('S: is unavailable', 'The S: drive is not connected in this VDI session. Reconnect it, then run again.'),
     ('Use only the specified Python executable', 'The Python you pasted is not the one that started this tool. Delete local_paths.cmd and run again to re-enter the paths.'),
     ('Playwright is required', 'A required add-on (Playwright) is missing. Run this tool once with --setup so it installs on S:.'),
@@ -2396,9 +2416,9 @@ class DiagnosticRecorder:
             name = label + '#' + str(number)
         self.snapshots[name] = snapshot = diag_try(collect_system_snapshot, **kwargs)
         variables = snapshot.get('environment_variables') if isinstance(snapshot, dict) else None
-        for variable in variables if isinstance(variables, dict) else ():
-            if variable.upper() not in _DIAG_STANDARD_ENV:
-                self.sanitizer.learn('VAR', variable)
+        custom = variables.get('custom_variables') if isinstance(variables, dict) else None
+        for variable in custom.value if isinstance(custom, Private) else ():
+            self.sanitizer.learn('VAR', variable)
         self.event('snapshot', 'system details captured: ' + name)
 
     def failure(self, exc, details):
@@ -2409,7 +2429,7 @@ class DiagnosticRecorder:
 
     def likely_causes(self):
         causes = list(self.facts.get('edge_causes', []))
-        text = self.failure_text.casefold()
+        text = (self.failure_text + ' ' + ' '.join(e['message'] for e in self.events if e['step'] == 'console')).casefold()
         for needle, advice in _DIAG_KNOWN_ERRORS:
             if needle.casefold() in text and advice not in causes:
                 causes.append(advice)

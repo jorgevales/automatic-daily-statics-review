@@ -26,6 +26,18 @@ class SanitizerTests(unittest.TestCase):
         self.assertIn('because it is locked', text)
         self.assertIn('UNC', text)
 
+    def test_folder_names_containing_words_are_not_cut(self):
+        # Real failure: a folder called "... and Projects" was split at "and", leaking the rest of the path.
+        text = self.s.clean(r"OSError: [Errno 2] No such file or directory: '\\\\srv01\\share\\Shared and Projects\\UK\\Projects\\Daily review\\users\\x\\f.py'")
+        for leaked in ('Projects', 'Daily', 'review', 'Shared', 'srv01', 'UK'):
+            self.assertNotIn(leaked, text)
+        text = self.s.clean('Log: \\\\srv01\\share\\Shared and Projects\\UK\\logs\\dependency-install.log. No C: fallback was used.')
+        self.assertNotIn('Projects', text)
+        self.assertIn('No C: fallback was used', text)
+        text = self.s.clean('File "S:\\Shared and Projects\\runner.py", line 9, in _main')
+        self.assertNotIn('Projects', text)
+        self.assertIn('line 9, in _main', text)
+
     def test_same_value_same_label(self):
         a = self.s.clean(r'C:\Users\x y\z.txt')
         b = self.s.clean(r'again C:\Users\x y\z.txt')
