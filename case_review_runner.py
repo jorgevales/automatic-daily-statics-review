@@ -2737,6 +2737,8 @@ class EdgeBrowser:
         self.used = set()
         self.connection_lock = asyncio.Lock()
         self.slot_lock = asyncio.Lock()
+        # Only one tab uploads at a time; overlapping uploads failed with "An error occurred while uploading".
+        self.upload_lock = asyncio.Lock()
 
     def ensure_started(self, only=None):
         """Debugging-port way: profile selection, reconciliation, then the port launch attempts."""
@@ -3258,6 +3260,8 @@ class EdgeBrowser:
 
     async def fresh(self, target):
         page = await self.page(target)
+        # A background tab may not render, so Playwright cannot finish a click on it. Bring it forward first.
+        await self.wake(target, foreground=True)
         deadline = time.monotonic() + self.c['login_timeout']
         while time.monotonic() < deadline:
             if await first_visible(editor_locators(page), 0) is not None:
@@ -3269,7 +3273,19 @@ class EdgeBrowser:
             page.locator('[data-testid="new-chat-button"]')], 3000)
         if button is None:
             raise RuntimeError('New chat control unavailable. Sign in to Copilot in the dedicated Edge window; existing conversations were preserved.')
-        await button.click(timeout=5000)
+        clicked = False
+        try:
+            await button.click(timeout=15000)
+            clicked = True
+        except Exception:
+            try:
+                await button.dispatch_event('click')
+                clicked = True
+            except Exception:
+                pass
+        if not clicked:
+            # Open the Copilot address again in this same dedicated tab: a clean conversation.
+            await page.goto(self.c['url'], wait_until='domcontentloaded', timeout=60000)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if await self.clean(page):
@@ -3308,27 +3324,28 @@ class EdgeBrowser:
         if not await self.clean(page):
             raise RuntimeError('Composer is not a proven fresh conversation')
         await self.model(page)
-        # Assign FileList once. No uncertain upload replay.
-        try:
-            await asyncio.wait_for(browser_local_set_input_files_bulk(page, paths), self.c['operation_timeout'])
-        except Exception as exc:
-            raise UncertainOperation('Upload assignment uncertain; no replay: ' + repr(exc)) from exc
-        await add_text_to_editor(page, message, 10000)
-        deadline = time.monotonic() + self.c['upload_timeout']
-        stable_at = None
-        while time.monotonic() < deadline:
-            state = await self.read(target, self.upload_snapshot)
-            if state.get('error') or state.get('warning'):
-                raise RuntimeError('Upload error/limitation: ' + json.dumps(state))
-            if exact_upload_ready(state, [path.name for path in paths]):
-                stable_at = stable_at or time.monotonic()
-                if time.monotonic() - stable_at >= 2:
-                    return
-            else:
-                stable_at = None
-            await self.read(target, background_wake_page)
-            await asyncio.sleep(.3)
-        raise RuntimeError('Partial/unverified uploads; no files omitted and no send performed')
+        async with self.upload_lock:
+            # Assign FileList once. No uncertain upload replay.
+            try:
+                await asyncio.wait_for(browser_local_set_input_files_bulk(page, paths), self.c['operation_timeout'])
+            except Exception as exc:
+                raise UncertainOperation('Upload assignment uncertain; no replay: ' + repr(exc)) from exc
+            await add_text_to_editor(page, message, 10000)
+            deadline = time.monotonic() + self.c['upload_timeout']
+            stable_at = None
+            while time.monotonic() < deadline:
+                state = await self.read(target, self.upload_snapshot)
+                if state.get('error') or state.get('warning'):
+                    raise RuntimeError('Upload error/limitation: ' + json.dumps(state))
+                if exact_upload_ready(state, [path.name for path in paths]):
+                    stable_at = stable_at or time.monotonic()
+                    if time.monotonic() - stable_at >= 2:
+                        return
+                else:
+                    stable_at = None
+                await self.read(target, background_wake_page)
+                await asyncio.sleep(.3)
+            raise RuntimeError('Partial/unverified uploads; no files omitted and no send performed')
 
     async def verify_pre_send(self, target, paths, message):
         page = await self.page(target)
@@ -3648,7 +3665,9 @@ class Runner:
                     # Uncertain upload/preparation never reuses this target for a new case.
                     self.targets.pop(slot, None)
                     return
-                # Retry only pre-send technical preparation, in a proven fresh chat.
+                # Retry only pre-send technical preparation, in a proven fresh chat. The failed tab may still
+                # hold attachments, so the retry takes another tab that proves clean.
+                self.targets.pop(slot, None)
                 if attempts >= self.c['technical_attempts']:
                     transition(record, 'blocked', error=repr(exc))
                     self.persist(record)
