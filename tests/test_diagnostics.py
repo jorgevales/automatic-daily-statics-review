@@ -106,6 +106,16 @@ class WindowsFactTests(unittest.TestCase):
             server.close()
 
 
+class EdgeEnvironmentTests(unittest.TestCase):
+    def test_normal_way_gets_the_launch_environment(self):
+        env = runner.edge_environment('normal')
+        self.assertEqual(env, runner._LAUNCH_ENVIRONMENT)
+        self.assertIsNot(env, runner._LAUNCH_ENVIRONMENT)
+
+    def test_redirected_way_keeps_the_current_environment(self):
+        self.assertEqual(runner.edge_environment('redirected'), dict(os.environ))
+
+
 class WakeTests(unittest.TestCase):
     def test_foreground_wake_passes_tab_and_reason(self):
         import asyncio

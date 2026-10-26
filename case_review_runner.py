@@ -778,10 +778,19 @@ _S_ROOT = None
 _ORIGINAL_EDGE_ENV = {key: os.environ.get('DCR_ORIGINAL_' + key, os.environ.get(key, '')) for key in
                       ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA')}
 
+_LAUNCH_ENVIRONMENT = dict(os.environ)
+
 _ORIGINAL_USER_ENV = {key: os.environ.get('DCR_ORIGINAL_' + key, os.environ.get(key, '')) for key in
                       ('USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOME', 'HOMEDRIVE', 'HOMEPATH')}
 
 _APPROVED_EDGE = set()
+
+def edge_environment(folders):
+    """'redirected': the S: copies this tool set up. 'normal': the environment the launcher had, as provided
+    (what a plain Popen() call inherits), with nothing redirected to S:."""
+    if folders == 'normal':
+        return dict(_LAUNCH_ENVIRONMENT)
+    return os.environ.copy()
 
 def edge_candidates():
     """Read installed Edge locations only; never install, update or copy Edge."""
@@ -2876,13 +2885,7 @@ class EdgeBrowser:
             profile.mkdir(parents=True, exist_ok=True)
             write_edge_preferences(self.paths, profile)
             cache = self.paths['cache'] / 'browser'; cache.mkdir(parents=True, exist_ok=True)
-            env = os.environ.copy()
-            if variant['folders'] == 'normal':
-                for key, value in _ORIGINAL_USER_ENV.items():
-                    if value:
-                        env[key] = value
-                    else:
-                        env.pop(key, None)
+            env = edge_environment(variant['folders'])
             options = {'user_data_dir': mapped_browser_path(profile), 'headless': os.environ.get('DCR_TEST_HEADLESS') == '1',
                        'args': [f'--disk-cache-dir={mapped_browser_path(cache)}', f'--crash-dumps-dir={mapped_browser_path(self.paths["crashes"])}',
                                 '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
@@ -3030,13 +3033,7 @@ class EdgeBrowser:
                  '--no-first-run', '--no-default-browser-check', '--disable-backgrounding-occluded-windows',
                  '--disable-renderer-backgrounding', '--disable-background-timer-throttling', '--disable-component-update',
                  '--disable-breakpad', '--disable-crash-reporter', self.c['url']]
-        child_env = os.environ.copy()
-        if variant['folders'] == 'normal':
-            for key, value in _ORIGINAL_USER_ENV.items():
-                if value:
-                    child_env[key] = value
-                else:
-                    child_env.pop(key, None)
+        child_env = edge_environment(variant['folders'])
         summary = {'variant': variant['name'], 'label': variant['label'], 'port_argument': port, 'ready': False,
                    'detected_by': None, 'port': None, 'seconds': None, 'new_edge_processes': None,
                    'launcher_exit_code': None, 'assessment': None, 'closed': None}
