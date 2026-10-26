@@ -106,6 +106,34 @@ class WindowsFactTests(unittest.TestCase):
             server.close()
 
 
+class WakeTests(unittest.TestCase):
+    def test_foreground_wake_passes_tab_and_reason(self):
+        import asyncio
+        calls = []
+
+        async def fake_activate(page, tab_number, reason, verbose=True):
+            calls.append((page, tab_number, reason, verbose))
+
+        async def fake_background(page):
+            return True
+
+        original, original_background = runner.activate_page_like_manual_selection, runner.background_wake_page
+        runner.activate_page_like_manual_selection = fake_activate
+        runner.background_wake_page = fake_background
+        try:
+            browser = runner.EdgeBrowser.__new__(runner.EdgeBrowser)
+
+            async def read(target, operation):
+                return await operation('PAGE')
+            browser.read = read
+
+            asyncio.run(runner.EdgeBrowser.wake(browser, 'target', foreground=True))
+        finally:
+            runner.activate_page_like_manual_selection = original
+            runner.background_wake_page = original_background
+        self.assertEqual(calls, [('PAGE', 0, 'foreground wake', False)])
+
+
 class EdgeMemoryTests(unittest.TestCase):
     def test_winner_is_tried_first_and_history_counts(self):
         with tempfile.TemporaryDirectory() as folder:

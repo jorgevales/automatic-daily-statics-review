@@ -2701,6 +2701,10 @@ def edge_explain_attempts(attempts):
         causes.append('Edge refused remote debugging in some of the ways it was started (its message: "' + refusals[0] + '").')
     for number, attempt in enumerate(attempts, 1):
         assessment = attempt.get('assessment') if isinstance(attempt.get('assessment'), dict) else {}
+        if attempt.get('failure_kind') == 'profile_singleton_lock':
+            causes.append(f'Way {number} ({attempt["label"]}): another Edge window is still using the dedicated profile. '
+                          'Close only the dedicated review Edge window (not your other Edge windows) and run again.')
+            continue
         if 'playwright_error' in assessment:
             causes.append(f'Way {number} ({attempt["label"]}): Playwright could not start Edge. Its message: "' + str(assessment['playwright_error'])[:300] + '"')
             continue
@@ -2737,9 +2741,10 @@ class EdgeBrowser:
         try:
             return self._ensure_started_once(only)
         except ProfileSingletonError as first:
-            assert_profile_recovery_safe(self)
             if only:
+                # start() reports the lock and never creates a new profile on its own.
                 raise
+            assert_profile_recovery_safe(self)
             selection, original = self._selection, self._original_profile
             if selection:
                 raise RuntimeError('The selected isolated Edge profile is also locked. No additional profile will be created. Close only the dedicated review window normally and retry. ' + str(first)) from first
@@ -2957,6 +2962,10 @@ class EdgeBrowser:
                 if attempt['ready']:
                     winner = (variant, attempt)
                     break
+                if attempt['summary'].get('failure_kind') == 'profile_singleton_lock':
+                    # Every other way uses the same profile, so it would hit the same lock. Stop here and report it.
+                    self.last_cdp_summary = attempt['summary']
+                    raise ProfileSingletonError('Edge cannot create its profile lock (ProcessSingleton): another Edge window is still using the dedicated profile. Close only the dedicated review Edge window and run again. Nothing was deleted, copied or terminated.')
                 print(f'Attempt {number} did not open a debugging port. Trying the next way.')
             if winner:
                 variant, attempt = winner
@@ -3345,7 +3354,8 @@ class EdgeBrowser:
     async def wake(self, target, foreground=False):
         await self.read(target, background_wake_page)
         if foreground:
-            await self.read(target, activate_page_like_manual_selection)
+            # read() passes only the page; this activation also needs a tab number and a reason.
+            await self.read(target, lambda page: activate_page_like_manual_selection(page, 0, 'foreground wake', verbose=False))
 
     async def diagnostics(self, target, directory, error):
         directory = Path(directory)
