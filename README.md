@@ -40,6 +40,15 @@ The terminal also prints the likely cause in plain English.
 
 ## Edge startup notes
 
-* The dedicated Edge uses port 9237 and never touches other Edge debugging sessions (for example on 9223).
-* The tool waits up to 120 seconds for Edge's debugging port and prints progress every 10 seconds.
-* It never relaunches, deletes a profile, changes policy, or replays an uncertain submission.
+* The dedicated Edge uses port 9237 by default and never touches other Edge debugging sessions (for example on 9223).
+* Edge is started in up to three ways, one after another (one dedicated profile can run only one Edge at a time):
+  1. configured port, S: folders
+  2. configured port, your normal Windows folders
+  3. automatic port, S: folders
+* While each way is tried, every way of finding the debug port runs at once (the configured port, the port Edge writes
+  into the profile, and any port opened by the Edge started in that attempt).
+* The way that works is saved in `edge-startup-memory.json` in the user's S: runtime folder and tried first next time.
+  Delete that file to start the order again.
+* A way that does not work is closed again. Only Edge processes started by that attempt are closed; other Edge windows
+  are never touched.
+* The tool never relaunches, deletes a profile, changes policy, or replays an uncertain submission.

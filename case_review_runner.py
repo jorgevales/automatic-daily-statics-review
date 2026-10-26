@@ -2151,7 +2151,7 @@ def diag_listeners(port=None):
             number = ((raw_port & 0xFF) << 8) | ((raw_port >> 8) & 0xFF)
             total += 1
             found.append({'family': family, 'address': address, 'port': number, 'pid': pid, 'program': names.get(pid, 'unknown')})
-    return {'total_listening': total,
+    return {'all_listening': found, 'total_listening': total,
             'on_configured_port': [x for x in found if port and x['port'] == int(port)],
             'in_debug_range_9000_9300': [x for x in found if 9000 <= x['port'] <= 9300]}
 
@@ -2346,7 +2346,8 @@ def diag_assess_edge(port, profile, before_pids, launcher_exit_code, stderr_path
             'new_edge_processes': [p for p in edge if p['pid'] not in before_pids],
             'listeners_on_port': on_port, 'probe': diag_try(diag_probe_port, port),
             'devtools_active_port': diag_try(diag_devtools_port, profile), 'policy_blocks': blocks,
-            'singleton': profile_singleton_failure(text)}
+            'singleton': profile_singleton_failure(text),
+            'devtools_refusal': (re.search(r'DevTools remote debugging [^.\n]*\.', text) or [None])[0] if text else None}
 
 
 def diag_explain_edge(a):
@@ -2576,6 +2577,111 @@ def begin_diagnostics(paths, argv):
     return _RECORDER
 
 
+# ---------- Edge launch variants: tried in order, the last winner first, and remembered ----------
+# One dedicated profile can run only one Edge at a time, so the ways of starting Edge run one after
+# another. The ways of DETECTING the debug port all run at once on every check.
+EDGE_ATTEMPT_SECONDS = 50
+EDGE_VARIANTS = [
+    {'name': 'configured-port', 'label': 'configured port, S: folders', 'port': 'configured', 'folders': 'redirected'},
+    {'name': 'normal-windows-folders', 'label': 'configured port, your normal Windows folders', 'port': 'configured', 'folders': 'normal'},
+    {'name': 'automatic-port', 'label': 'automatic port, S: folders', 'port': 'automatic', 'folders': 'redirected'},
+]
+
+
+def edge_memory_path(paths):
+    return paths['home'] / 'edge-startup-memory.json'
+
+
+def edge_memory_read(paths):
+    memory = read_json(edge_memory_path(paths), {})
+    return memory if isinstance(memory, dict) else {}
+
+
+def edge_variant_order(memory, forced_normal_folders=False):
+    if forced_normal_folders:
+        return [v for v in EDGE_VARIANTS if v['name'] == 'normal-windows-folders']
+    winner = memory.get('winner')
+    return [v for v in EDGE_VARIANTS if v['name'] == winner] + [v for v in EDGE_VARIANTS if v['name'] != winner]
+
+
+def edge_memory_record(paths, memory, attempts, variant, attempt):
+    """Count every attempt. A success becomes the remembered first choice for future runs."""
+    history = dict(memory.get('history', {}))
+    for item in attempts:
+        entry = dict(history.get(item['variant'], {'ok': 0, 'failed': 0}))
+        entry['ok' if item['ready'] else 'failed'] = entry.get('ok' if item['ready'] else 'failed', 0) + 1
+        history[item['variant']] = entry
+    if variant is None:
+        record = {**memory, 'history': history, 'last_run_found_port': False, 'saved': now()}
+    else:
+        record = {'winner': variant['name'], 'winner_label': variant['label'], 'detected_by': attempt['detected_by'],
+                  'port': attempt['port'], 'saved': now(), 'history': history, 'last_run_found_port': True}
+    atomic_json(edge_memory_path(paths), record)
+    return record
+
+
+def edge_tree_pids(root, before_edge):
+    """The launched Edge process and the Edge processes started under it. Other Edge windows are never included."""
+    try:
+        rows = diag_processes()['msedge']
+    except Exception:
+        return set()
+    tree = {root} if any(row['pid'] == root for row in rows) else set()
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            if row['pid'] not in tree and row['pid'] not in before_edge and row['parent_pid'] in tree:
+                tree.add(row['pid'])
+                changed = True
+    return tree
+
+
+def diag_terminate(pids):
+    """Terminate only the given processes (children first). Used only on processes this run started."""
+    if os.name != 'nt':
+        return {}
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    results = {}
+    for pid in sorted(pids, reverse=True):
+        handle = kernel.OpenProcess(0x0001, False, pid)
+        if not handle:
+            results[pid] = 'could not open (already closed)'
+            continue
+        ok = kernel.TerminateProcess(handle, 0)
+        kernel.CloseHandle(handle)
+        results[pid] = 'closed' if ok else 'could not close'
+    return results
+
+
+def _listener_rows():
+    listing = diag_try(diag_listeners, None)
+    return listing.get('all_listening', []) if isinstance(listing, dict) else []
+
+
+def edge_explain_attempts(attempts):
+    """Plain-English causes for a run in which no way of starting Edge opened the debug port."""
+    causes = []
+    refusals = [a['assessment'].get('devtools_refusal') for a in attempts
+                if isinstance(a.get('assessment'), dict) and a['assessment'].get('devtools_refusal')]
+    if refusals and len(refusals) == len(attempts):
+        causes.append(f'Edge refused remote debugging in all {len(attempts)} ways it was started. Its own message: "' + refusals[0] + '". '
+                      'The dedicated profile folder is probably not accepted as a non-default data folder on this VDI. Send this report.')
+    elif refusals:
+        causes.append('Edge refused remote debugging in some of the ways it was started (its message: "' + refusals[0] + '").')
+    for number, attempt in enumerate(attempts, 1):
+        assessment = attempt.get('assessment') if isinstance(attempt.get('assessment'), dict) else {}
+        causes.append(f'Way {number} ({attempt["label"]}): no debug port after {attempt["seconds"]} s; '
+                      f'{attempt["new_edge_processes"]} new Edge processes; this attempt closed its own Edge: '
+                      + ('yes' if (attempt.get('closed') or {}).get('terminated') else 'no') + '.')
+        for cause in diag_explain_edge(assessment):
+            if cause not in causes:
+                causes.append(cause)
+    return causes
+
+
 class EdgeBrowser:
     def __init__(self, config, paths):
         self.c, self.paths = config, paths
@@ -2588,6 +2694,11 @@ class EdgeBrowser:
 
     def ensure_started(self):
         original = require_s(self.c['profile_dir'], 'Edge profile')
+        remembered = read_json(self.marker, {})
+        if remembered.get('port') and remembered.get('profile') == str(original):
+            # The verified dedicated session may be on the port that worked last time.
+            self.c['port'] = int(remembered['port'])
+            self.endpoint = f'http://127.0.0.1:{self.c["port"]}'
         selection_path = self.paths['home'] / 'edge-profile-selection.json'
         selection = read_json(selection_path, {})
         if selection and selection.get('original_profile') == str(original):
@@ -2637,8 +2748,12 @@ class EdgeBrowser:
     def _ensure_started_once(self):
         profile = require_s(self.c['profile_dir'], 'Edge profile')
         profile.mkdir(parents=True, exist_ok=True)
-        payload = get_cdp_version(self.endpoint)
         marker = read_json(self.marker, {})
+        if marker.get('port') and marker.get('profile') == str(profile):
+            # A previous run recorded which port its verified dedicated session used.
+            self.c['port'] = int(marker['port'])
+            self.endpoint = f'http://127.0.0.1:{self.c["port"]}'
+        payload = get_cdp_version(self.endpoint)
         if payload:
             if marker.get('websocket') != payload['webSocketDebuggerUrl'] or marker.get('profile') != str(profile):
                 raise RuntimeError('Debug port belongs to an unverified/old session. Preserve unresolved cases; close only your old dedicated browser or choose --port. No unrelated session was adopted.')
@@ -2652,26 +2767,24 @@ class EdgeBrowser:
             atomic_json(preferences, {'download': {'default_directory': mapped_browser_path(self.paths['downloads']), 'prompt_for_download': False},
                                       'savefile': {'default_directory': mapped_browser_path(self.paths['downloads'])}})
         cache = self.paths['cache'] / 'browser'; cache.mkdir(parents=True, exist_ok=True)
-        flags = [str(executable), f'--remote-debugging-port={self.c["port"]}', '--remote-debugging-address=127.0.0.1',
-                 f'--user-data-dir={mapped_browser_path(profile)}', f'--disk-cache-dir={mapped_browser_path(cache)}',
-                 f'--crash-dumps-dir={mapped_browser_path(self.paths["crashes"])}', f'--log-file={mapped_browser_path(self.paths["logs"] / "browser.log")}', '--enable-logging',
-                 '--no-first-run', '--no-default-browser-check', '--disable-backgrounding-occluded-windows',
-                 '--disable-renderer-backgrounding', '--disable-background-timer-throttling', '--disable-component-update',
-                 '--disable-breakpad', '--disable-crash-reporter', self.c['url']]
         diagnostic = self.paths['logs'] / ('edge-startup-' + uuid.uuid4().hex + '.json')
         stderr_path = diagnostic.with_suffix('.stderr.log')
+        memory = edge_memory_read(self.paths)
+        variants = edge_variant_order(memory, self.c.get('edge_original_env'))
         report = {'created': now(), 'endpoint': self.endpoint, 'profile': str(profile),
-                  'executable': str(executable), 'edge_version': diag_edge_version(executable), 'flags': flags,
-                  'policies': edge_policy_snapshot(), 'stderr_log': str(stderr_path), 'status': 'preflight',
-                  'user_folders_for_edge': 'normal Windows folders' if self.c.get('edge_original_env') else 'redirected to S:',
-                  'storage_checks': [], 'note': 'No policy changes, elevation, browser download or profile reset.'}
+                  'executable': str(executable), 'edge_version': diag_edge_version(executable),
+                  'policies': edge_policy_snapshot(), 'status': 'preflight', 'stderr_log': str(stderr_path),
+                  'variants_in_order': [v['name'] for v in variants], 'remembered_winner': memory.get('winner'),
+                  'attempts': [], 'storage_checks': [],
+                  'note': 'No policy changes, elevation, browser download or profile reset.'}
         atomic_json(diagnostic, report)
         recorder = _RECORDER
         log_files = {'edge stderr': stderr_path, 'browser.log': self.paths['logs'] / 'browser.log'}
         if recorder:
             recorder.facts.update(port=self.c['port'], profile=str(profile), logs=log_files, edge_exe=str(executable),
-                                  edge_version=report['edge_version'], user_folders_for_edge=report['user_folders_for_edge'])
-            recorder.event('edge', 'Starting the dedicated Edge', port=self.c['port'], flags=flags)
+                                  edge_version=report['edge_version'], variants_in_order=report['variants_in_order'],
+                                  remembered_winner=memory.get('winner'))
+            recorder.event('edge', 'Starting the dedicated Edge', variants=report['variants_in_order'])
         before_edge = diag_edge_pids()
         try:
             for directory in (profile, cache, self.paths['downloads'], self.paths['crashes'], self.paths['logs']):
@@ -2690,67 +2803,38 @@ class EdgeBrowser:
             print('Edge startup diagnostics: ' + str(diagnostic))
             if recorder:
                 recorder.snapshot('before_launch', port=self.c['port'], profile=profile, logs=log_files)
-            child_env = os.environ.copy()
-            if self.c.get('edge_original_env'):
-                print('Test mode: Edge is started with your normal Windows user folders instead of the S: copies.')
-                for key, value in _ORIGINAL_USER_ENV.items():
-                    if value:
-                        child_env[key] = value
-                    else:
-                        child_env.pop(key, None)
-            with open(stderr_path, 'ab', buffering=0) as browser_log:
-                process = subprocess.Popen(flags, executable=str(executable), cwd=mapped_browser_path(PACKAGE), env=child_env,
-                                 stdin=subprocess.DEVNULL, stdout=browser_log, stderr=browser_log,
-                                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS)
-            report['pid'] = process.pid
-            wait_seconds = 120
-            started = time.monotonic()
-            deadline, next_note = started + wait_seconds, started + 10
-            report['poll_samples'] = []
-            while time.monotonic() < deadline:
-                payload = get_cdp_version(self.endpoint, 2.0)
-                if payload:
-                    atomic_json(self.marker, {'websocket': payload['webSocketDebuggerUrl'], 'profile': str(profile),
-                                              'executable': str(executable), 'created': now(), 'storage_policy': 'S-drive-only/v1'})
-                    report.update(status='endpoint_ready', launcher_exit_code=process.poll(), seconds_to_ready=round(time.monotonic() - started, 1))
-                    atomic_json(diagnostic, report)
-                    if recorder:
-                        recorder.event('edge', 'Edge debug endpoint is ready', seconds=report['seconds_to_ready'])
-                        recorder.snapshot('after_ready', port=self.c['port'], profile=profile, light=True)
-                    return
-                # Edge's launcher can exit after handing off to another process;
-                # record that fact, but do not relaunch or infer a crash from it.
-                report['launcher_exit_code'] = process.poll()
-                if report['launcher_exit_code'] is not None:
-                    try:
-                        with open(long_io_path(stderr_path), encoding='utf-8', errors='replace') as stream:
-                            browser_output = stream.read(1024 * 1024)
-                    except OSError:
-                        browser_output = ''
-                    if profile_singleton_failure(browser_output):
-                        report['failure_kind'] = 'profile_singleton_lock'
-                        raise ProfileSingletonError('Edge cannot create its profile lock (ProcessSingleton). The existing profile was not deleted, copied, unlocked or terminated.')
-                if time.monotonic() >= next_note:
-                    next_note += 10
-                    sample = diag_wait_sample(self.c['port'], profile, before_edge)
-                    sample['seconds'] = int(time.monotonic() - started)
-                    report['poll_samples'] = (report['poll_samples'] + [sample])[-20:]
-                    atomic_json(diagnostic, report)
-                    print(f'Waiting for Edge to open its debug port ({sample["seconds"]}s of {wait_seconds}s)...')
-                    if recorder:
-                        recorder.event('edge', 'Waiting for the debug port', sample=sample)
-                time.sleep(.2)
-            assessment = diag_assess_edge(self.c['port'], profile, before_edge, report.get('launcher_exit_code'), stderr_path, report['policies'])
-            causes = diag_explain_edge(assessment)
-            report.update(assessment=assessment, likely_cause=causes)
+            winner = None
+            for number, variant in enumerate(variants, 1):
+                print(f'Edge start attempt {number} of {len(variants)}: {variant["label"]}')
+                attempt = self._launch_attempt(variant, executable, profile, cache, stderr_path, before_edge, report, recorder)
+                report['attempts'].append(attempt['summary'])
+                atomic_json(diagnostic, report)
+                if attempt['ready']:
+                    winner = (variant, attempt)
+                    break
+                print(f'Attempt {number} did not open a debugging port. Trying the next way.')
+            if winner:
+                variant, attempt = winner
+                edge_memory_record(self.paths, memory, report['attempts'], variant, attempt)
+                report.update(status='endpoint_ready', winner=variant['name'], detected_by=attempt['detected_by'])
+                atomic_json(diagnostic, report)
+                print(f'Edge debug port found by "{attempt["detected_by"]}" using: {variant["label"]}. This choice is remembered for next time.')
+                if recorder:
+                    recorder.event('edge', 'Edge debug endpoint is ready', winner=variant['name'], detected_by=attempt['detected_by'])
+                    recorder.snapshot('after_ready', port=self.c['port'], profile=profile, light=True)
+                return
+            edge_memory_record(self.paths, memory, report['attempts'], None, None)
+            causes = edge_explain_attempts(report['attempts'])
+            report.update(likely_cause=causes)
             atomic_json(diagnostic, report)
             if recorder:
-                recorder.facts.update(edge_assessment=assessment, edge_causes=causes)
+                recorder.facts.update(edge_attempts=[{k: v for k, v in a.items() if k != 'assessment'} for a in report['attempts']],
+                                      edge_causes=causes)
             print('LIKELY CAUSE (plain English):')
             for cause in causes:
                 print('  - ' + cause)
-            raise RuntimeError(f'Edge endpoint did not become available within {wait_seconds} seconds. Likely cause: ' + ' '.join(causes)
-                               + ' No automatic relaunch or profile deletion was attempted.')
+            raise RuntimeError(f'Edge did not open a debugging port in any of {len(variants)} attempts. Likely cause: ' + ' '.join(causes)
+                               + ' No profile was deleted and no uncertain submission was repeated.')
         except Exception as exc:
             report.update(status='failed', error=str(exc))
             atomic_json(diagnostic, report)
@@ -2759,6 +2843,104 @@ class EdgeBrowser:
                 recorder.snapshot('at_failure', port=self.c['port'], profile=profile, logs=log_files)
             error_type = ProfileSingletonError if isinstance(exc, ProfileSingletonError) else RuntimeError
             raise error_type(str(exc) + '\nStartup diagnostics: ' + str(diagnostic) + '\nBrowser output: ' + str(stderr_path)) from exc
+
+    def _launch_attempt(self, variant, executable, profile, cache, stderr_path, before_edge, report, recorder):
+        """Start Edge one way, watch every detection method at once, and clean up only this attempt's processes."""
+        configured = variant['port'] == 'configured'
+        port = self.c['port'] if configured else 0
+        attempt_stderr = stderr_path.with_name(stderr_path.name.replace('.stderr.log', '') + '.' + variant['name'] + '.stderr.log')
+        flags = [str(executable), f'--remote-debugging-port={port}', '--remote-debugging-address=127.0.0.1',
+                 f'--user-data-dir={mapped_browser_path(profile)}', f'--disk-cache-dir={mapped_browser_path(cache)}',
+                 f'--crash-dumps-dir={mapped_browser_path(self.paths["crashes"])}', f'--log-file={mapped_browser_path(self.paths["logs"] / "browser.log")}', '--enable-logging',
+                 '--no-first-run', '--no-default-browser-check', '--disable-backgrounding-occluded-windows',
+                 '--disable-renderer-backgrounding', '--disable-background-timer-throttling', '--disable-component-update',
+                 '--disable-breakpad', '--disable-crash-reporter', self.c['url']]
+        child_env = os.environ.copy()
+        if variant['folders'] == 'normal':
+            for key, value in _ORIGINAL_USER_ENV.items():
+                if value:
+                    child_env[key] = value
+                else:
+                    child_env.pop(key, None)
+        summary = {'variant': variant['name'], 'label': variant['label'], 'port_argument': port, 'ready': False,
+                   'detected_by': None, 'port': None, 'seconds': None, 'new_edge_processes': None,
+                   'launcher_exit_code': None, 'assessment': None, 'closed': None}
+        if recorder:
+            recorder.event('edge', 'Starting the dedicated Edge (' + variant['name'] + ')', port=port, flags=flags)
+        started = time.monotonic()
+        deadline, next_note = started + EDGE_ATTEMPT_SECONDS, started + 10
+        with open(attempt_stderr, 'ab', buffering=0) as browser_log:
+            process = subprocess.Popen(flags, executable=str(executable), cwd=mapped_browser_path(PACKAGE), env=child_env,
+                                       stdin=subprocess.DEVNULL, stdout=browser_log, stderr=browser_log,
+                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS)
+        found = None
+        while time.monotonic() < deadline:
+            new = diag_edge_pids() - before_edge
+            found = self._detect_endpoint(profile, new, configured)
+            if found:
+                break
+            if process.poll() is not None:
+                with open(long_io_path(attempt_stderr), encoding='utf-8', errors='replace') as stream:
+                    if profile_singleton_failure(stream.read(1024 * 1024)):
+                        summary['failure_kind'] = 'profile_singleton_lock'
+                        break
+            if time.monotonic() >= next_note:
+                next_note += 10
+                print(f'  waiting for the debug port ({int(time.monotonic() - started)}s of {EDGE_ATTEMPT_SECONDS}s)...')
+            time.sleep(.3)
+        summary.update(seconds=round(time.monotonic() - started, 1), launcher_exit_code=process.poll(),
+                       new_edge_processes=len(diag_edge_pids() - before_edge))
+        if found:
+            method, found_port, payload = found
+            self.c['port'] = found_port
+            self.endpoint = f'http://127.0.0.1:{found_port}'
+            atomic_json(self.marker, {'websocket': payload['webSocketDebuggerUrl'], 'profile': str(profile),
+                                      'executable': str(executable), 'created': now(), 'storage_policy': 'S-drive-only/v1',
+                                      'port': found_port, 'variant': variant['name'], 'detected_by': method})
+            summary.update(ready=True, detected_by=method, port=found_port)
+            return {'ready': True, 'detected_by': method, 'port': found_port, 'summary': summary}
+        summary['assessment'] = diag_assess_edge(self.c['port'], profile, before_edge, process.poll(), attempt_stderr, report['policies'])
+        summary['closed'] = self._close_attempt(process.pid, before_edge, profile)
+        if recorder:
+            recorder.event('edge', 'Attempt ' + variant['name'] + ' did not open a debug port', 'error', closed=summary['closed'])
+        return {'ready': False, 'summary': summary}
+
+    def _detect_endpoint(self, profile, new_edge_pids, configured):
+        """Run every detection method at once. Only ports owned by Edge processes started since launch count."""
+        probes = []
+        if configured and self.c['port'] in {item['port'] for item in _listener_rows() if item['pid'] in new_edge_pids}:
+            probes.append(('configured port owned by new Edge', self.c['port']))
+        active = diag_try(diag_devtools_port, profile)
+        if isinstance(active, dict) and str(active.get('port') or '').isdigit():
+            probes.append(('DevToolsActivePort file in the dedicated profile', int(active['port'])))
+        for item in _listener_rows():
+            if item['pid'] in new_edge_pids and 1024 <= item['port'] <= 65535:
+                probes.append(('listening port owned by new Edge', item['port']))
+        unique = list(dict.fromkeys(probes))
+        if not unique:
+            return None
+        with ThreadPoolExecutor(max_workers=len(unique)) as pool:
+            futures = {pool.submit(get_cdp_version, f'http://127.0.0.1:{number}', 1.5): (method, number) for method, number in unique}
+            for future in as_completed(futures):
+                try:
+                    payload = future.result()
+                except Exception:
+                    payload = None
+                if payload:
+                    method, number = futures[future]
+                    return method, number, payload
+        return None
+
+    def _close_attempt(self, root, before_edge, profile):
+        """Close only the Edge processes this attempt started (the launcher and its children)."""
+        tree = edge_tree_pids(root, before_edge)
+        if not tree:
+            return {'terminated': {}, 'note': 'The launched Edge had already handed off; nothing of this attempt was closed.'}
+        results = diag_terminate(tree)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and (diag_edge_pids() & tree):
+            time.sleep(.3)
+        return {'terminated': results, 'still_running': sorted(diag_edge_pids() & tree)}
 
     async def __aenter__(self):
         load_playwright()

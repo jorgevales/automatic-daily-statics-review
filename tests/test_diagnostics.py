@@ -106,6 +106,33 @@ class WindowsFactTests(unittest.TestCase):
             server.close()
 
 
+class EdgeMemoryTests(unittest.TestCase):
+    def test_winner_is_tried_first_and_history_counts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths = {'home': Path(folder)}
+            memory = runner.edge_memory_read(paths)
+            self.assertEqual([v['name'] for v in runner.edge_variant_order(memory)],
+                             ['configured-port', 'normal-windows-folders', 'automatic-port'])
+            attempts = [{'variant': 'configured-port', 'label': 'a', 'ready': False},
+                        {'variant': 'normal-windows-folders', 'label': 'b', 'ready': True}]
+            winner = runner.EDGE_VARIANTS[1]
+            runner.edge_memory_record(paths, memory, attempts, winner, {'detected_by': 'listening port owned by new Edge', 'port': 9100})
+            memory = runner.edge_memory_read(paths)
+            self.assertEqual(memory['winner'], 'normal-windows-folders')
+            self.assertEqual(memory['history']['configured-port'], {'ok': 0, 'failed': 1})
+            self.assertEqual([v['name'] for v in runner.edge_variant_order(memory)][0], 'normal-windows-folders')
+
+    def test_forced_test_mode_uses_only_normal_folders(self):
+        names = [v['name'] for v in runner.edge_variant_order({}, forced_normal_folders=True)]
+        self.assertEqual(names, ['normal-windows-folders'])
+
+    def test_refusal_message_is_explained(self):
+        attempts = [{'variant': 'configured-port', 'label': 'configured', 'seconds': 50, 'new_edge_processes': 3,
+                     'closed': {'terminated': {1: 'closed'}}, 'assessment': {'devtools_refusal': 'DevTools remote debugging requires a non-default data directory.'}}]
+        text = ' '.join(runner.edge_explain_attempts(attempts))
+        self.assertIn('refused remote debugging in all 1 ways', text)
+
+
 class ExplainTests(unittest.TestCase):
     base = {'configured_port': 9237, 'listeners_on_port': [], 'probe': {}, 'devtools_active_port': None,
             'new_edge_processes': [], 'policy_blocks': [], 'singleton': False}
