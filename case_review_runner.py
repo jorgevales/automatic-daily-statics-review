@@ -1726,6 +1726,32 @@ def transition(record, state, **values):
     record.update(values); record['state'] = state; record['updated'] = now()
 
 
+def unpack_wheels(wheels, target):
+    """Unpack downloaded wheels into target the way pip --target does, keeping every path on S:."""
+    wheels, target = s_spelling(require_s(wheels, 'Wheel folder')), s_spelling(require_s(target, 'Dependency folder'))
+    target.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for wheel in sorted(Path(os.fsdecode(wheels)).glob('*.whl')):
+        with zipfile.ZipFile(long_io_path(wheel)) as archive:
+            for item in archive.infolist():
+                name = item.filename
+                # Installer scripts and data folders are not needed by this tool; skip them.
+                if '.data/' in name:
+                    continue
+                destination = Path(os.path.normpath(str(target / name)))
+                if not str(destination).casefold().startswith(str(target).casefold() + os.sep):
+                    raise RuntimeError('Unsafe path inside downloaded package ' + wheel.name + '; not unpacked.')
+                if item.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(item) as source, open(long_io_path(destination), 'wb') as out:
+                    shutil.copyfileobj(source, out)
+                count += 1
+    print(f'Unpacked {count} package files onto S:.')
+    return count
+
+
 def ensure_dependencies(paths, setup=False):
     modules = ('playwright.async_api', 'pypdf', 'msoffcrypto', 'PIL.Image', 'olefile', 'greenlet', 'pyee', 'cryptography')
     missing = []
@@ -1744,9 +1770,13 @@ def ensure_dependencies(paths, setup=False):
                                'Choose a shorter working folder on S: and run again. The tool will ask for it again '
                                'after you delete local_paths.cmd.')
         bootstrap_pip()
-        child('--pip-internal', ['--isolated', '--disable-pip-version-check', 'install', '--only-binary=:all:',
-              '--no-user', '--no-compile', '--no-warn-script-location', '--target', paths['deps'],
-              '--cache-dir', paths['pip_cache'], *REQUIREMENTS], 'dependency-install.log')
+        # pip's own install step converts S: to the long network path and hits the 260-character
+        # limit. So pip only DOWNLOADS the wheels (including dependencies of dependencies), and this
+        # tool unpacks them into the short S: folder itself. A wheel is a zip file.
+        wheels = paths['deps'].parent / 'wheels'
+        child('--pip-internal', ['--isolated', '--disable-pip-version-check', 'download', '--only-binary=:all:',
+              '--dest', wheels, '--cache-dir', paths['pip_cache'], *REQUIREMENTS], 'dependency-download.log')
+        unpack_wheels(wheels, paths['deps'])
         # A clean child verifies DLL/native-extension imports after installation.
         child('--verify-dependencies', [], 'dependency-check.log')
         importlib.invalidate_caches()
