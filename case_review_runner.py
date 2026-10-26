@@ -2581,11 +2581,34 @@ def begin_diagnostics(paths, argv):
 # One dedicated profile can run only one Edge at a time, so the ways of starting Edge run one after
 # another. The ways of DETECTING the debug port all run at once on every check.
 EDGE_ATTEMPT_SECONDS = 50
+EDGE_PIPE_TIMEOUT_MS = 60000
 EDGE_VARIANTS = [
-    {'name': 'configured-port', 'label': 'configured port, S: folders', 'port': 'configured', 'folders': 'redirected'},
-    {'name': 'normal-windows-folders', 'label': 'configured port, your normal Windows folders', 'port': 'configured', 'folders': 'normal'},
-    {'name': 'automatic-port', 'label': 'automatic port, S: folders', 'port': 'automatic', 'folders': 'redirected'},
+    {'name': 'pipe-installed-edge', 'label': 'Playwright-started Edge, installed Edge file, S: folders', 'mode': 'pipe', 'exe': 'path', 'port': None, 'folders': 'redirected'},
+    {'name': 'pipe-edge-channel', 'label': 'Playwright-started Edge, Edge channel, S: folders', 'mode': 'pipe', 'exe': 'channel', 'port': None, 'folders': 'redirected'},
+    {'name': 'pipe-normal-folders', 'label': 'Playwright-started Edge, installed Edge file, normal Windows folders', 'mode': 'pipe', 'exe': 'path', 'port': None, 'folders': 'normal'},
+    {'name': 'configured-port', 'label': 'debugging port, S: folders', 'mode': 'cdp', 'port': 'configured', 'folders': 'redirected'},
+    {'name': 'normal-windows-folders', 'label': 'debugging port, normal Windows folders', 'mode': 'cdp', 'port': 'configured', 'folders': 'normal'},
+    {'name': 'automatic-port', 'label': 'debugging automatic port, S: folders', 'mode': 'cdp', 'port': 'automatic', 'folders': 'redirected'},
 ]
+
+
+def write_edge_preferences(paths, profile):
+    preferences = profile / 'Default' / 'Preferences'
+    if not preferences.exists():
+        atomic_json(preferences, {'download': {'default_directory': mapped_browser_path(paths['downloads']), 'prompt_for_download': False},
+                                  'savefile': {'default_directory': mapped_browser_path(paths['downloads'])}})
+
+
+class PipeBrowser:
+    """Stands in for a Browser when Playwright started Edge itself. Only the parts the runner uses are provided."""
+    def __init__(self, context):
+        self.context = context
+        self.contexts = [context]
+        self.closed = False
+        context.on('close', lambda *_: setattr(self, 'closed', True))
+
+    def is_connected(self):
+        return not self.closed
 
 
 def edge_memory_path(paths):
@@ -2597,9 +2620,13 @@ def edge_memory_read(paths):
     return memory if isinstance(memory, dict) else {}
 
 
+def edge_cdp_variants(order):
+    return [v for v in order if v['mode'] == 'cdp']
+
+
 def edge_variant_order(memory, forced_normal_folders=False):
     if forced_normal_folders:
-        return [v for v in EDGE_VARIANTS if v['name'] == 'normal-windows-folders']
+        return [v for v in EDGE_VARIANTS if v['folders'] == 'normal']
     winner = memory.get('winner')
     return [v for v in EDGE_VARIANTS if v['name'] == winner] + [v for v in EDGE_VARIANTS if v['name'] != winner]
 
@@ -2614,8 +2641,9 @@ def edge_memory_record(paths, memory, attempts, variant, attempt):
     if variant is None:
         record = {**memory, 'history': history, 'last_run_found_port': False, 'saved': now()}
     else:
-        record = {'winner': variant['name'], 'winner_label': variant['label'], 'detected_by': attempt['detected_by'],
-                  'port': attempt['port'], 'saved': now(), 'history': history, 'last_run_found_port': True}
+        record = {'winner': variant['name'], 'winner_label': variant['label'], 'mode': variant['mode'],
+                  'detected_by': attempt['detected_by'], 'port': attempt['port'], 'saved': now(), 'history': history,
+                  'last_run_found_port': True}
     atomic_json(edge_memory_path(paths), record)
     return record
 
@@ -2673,6 +2701,9 @@ def edge_explain_attempts(attempts):
         causes.append('Edge refused remote debugging in some of the ways it was started (its message: "' + refusals[0] + '").')
     for number, attempt in enumerate(attempts, 1):
         assessment = attempt.get('assessment') if isinstance(attempt.get('assessment'), dict) else {}
+        if 'playwright_error' in assessment:
+            causes.append(f'Way {number} ({attempt["label"]}): Playwright could not start Edge. Its message: "' + str(assessment['playwright_error'])[:300] + '"')
+            continue
         causes.append(f'Way {number} ({attempt["label"]}): no debug port after {attempt["seconds"]} s; '
                       f'{attempt["new_edge_processes"]} new Edge processes; this attempt closed its own Edge: '
                       + ('yes' if (attempt.get('closed') or {}).get('terminated') else 'no') + '.')
@@ -2688,37 +2719,28 @@ class EdgeBrowser:
         self.endpoint = f'http://127.0.0.1:{config["port"]}'
         self.marker = paths['home'] / 'browser-session.json'
         self.browser = None
+        self.mode = None
+        self.last_cdp_summary = None
         self.used = set()
         self.connection_lock = asyncio.Lock()
         self.slot_lock = asyncio.Lock()
 
-    def ensure_started(self):
-        original = require_s(self.c['profile_dir'], 'Edge profile')
+    def ensure_started(self, only=None):
+        """Debugging-port way: profile selection, reconciliation, then the port launch attempts."""
         remembered = read_json(self.marker, {})
-        if remembered.get('port') and remembered.get('profile') == str(original):
+        if remembered.get('port') and remembered.get('profile') == str(require_s(self.c['profile_dir'], 'Edge profile')):
             # The verified dedicated session may be on the port that worked last time.
             self.c['port'] = int(remembered['port'])
             self.endpoint = f'http://127.0.0.1:{self.c["port"]}'
-        selection_path = self.paths['home'] / 'edge-profile-selection.json'
-        selection = read_json(selection_path, {})
-        if selection and selection.get('original_profile') == str(original):
-            selected = require_s(selection.get('selected_profile'), 'Selected Edge profile')
-            if selected.parent != original.parent or not selected.name.startswith(original.name + '-isolated-'):
-                raise RuntimeError('Unexpected selected profile location; startup stopped without changing it.')
-            self.c['profile_dir'] = str(selected)
-        if self.marker.exists() and not get_cdp_version(self.endpoint):
-            # Never relaunch a verified session with unresolved assignments.
-            store = getattr(self, 'startup_store', None)
-            if store is None:
-                raise RuntimeError('Original browser endpoint unavailable and shared reconciliation records missing; no relaunch.')
-            for path in store.records.glob('*.json'):
-                record = read_json(path)
-                if not isinstance(record, dict) or record.get('state') not in {'discovered', 'ready', 'blocked', 'retryable failure', 'completed'} or (record.get('state') != 'completed' and record.get('assignment')):
-                    raise RuntimeError('Original browser endpoint unavailable with an unresolved case. Preserve the original session; no new profile or relaunch was attempted.')
+        self._apply_profile_selection()
+        self._check_reconciliation()
         try:
-            return self._ensure_started_once()
+            return self._ensure_started_once(only)
         except ProfileSingletonError as first:
             assert_profile_recovery_safe(self)
+            if only:
+                raise
+            selection, original = self._selection, self._original_profile
             if selection:
                 raise RuntimeError('The selected isolated Edge profile is also locked. No additional profile will be created. Close only the dedicated review window normally and retry. ' + str(first)) from first
             budget_path = self.paths['home'] / ('edge-profile-recovery-' + digest(str(original))[:16] + '.json')
@@ -2742,10 +2764,136 @@ class EdgeBrowser:
                 raise RuntimeError('Isolated Edge profile also failed. No more automatic attempts, profile deletion or process termination. ' + str(exc)) from exc
             recovery.update(status='endpoint_ready', completed=now())
             atomic_json(budget_path, recovery)
-            atomic_json(selection_path, recovery)
+            atomic_json(self._selection_path, recovery)
             return result
 
-    def _ensure_started_once(self):
+    def _apply_profile_selection(self):
+        if getattr(self, '_original_profile', None) is None:
+            self._original_profile = require_s(self.c['profile_dir'], 'Edge profile')
+        self._selection_path = self.paths['home'] / 'edge-profile-selection.json'
+        self._selection = read_json(self._selection_path, {})
+        selection, original = self._selection, self._original_profile
+        if selection and selection.get('original_profile') == str(original):
+            selected = require_s(selection.get('selected_profile'), 'Selected Edge profile')
+            if selected.parent != original.parent or not selected.name.startswith(original.name + '-isolated-'):
+                raise RuntimeError('Unexpected selected profile location; startup stopped without changing it.')
+            self.c['profile_dir'] = str(selected)
+
+    def _check_reconciliation(self):
+        if self.marker.exists() and not get_cdp_version(self.endpoint):
+            # Never relaunch a verified session with unresolved assignments.
+            store = getattr(self, 'startup_store', None)
+            if store is None:
+                raise RuntimeError('Original browser endpoint unavailable and shared reconciliation records missing; no relaunch.')
+            for path in store.records.glob('*.json'):
+                record = read_json(path)
+                if not isinstance(record, dict) or record.get('state') not in {'discovered', 'ready', 'blocked', 'retryable failure', 'completed'} or (record.get('state') != 'completed' and record.get('assignment')):
+                    raise RuntimeError('Original browser endpoint unavailable with an unresolved case. Preserve the original session; no new profile or relaunch was attempted.')
+
+    async def start(self):
+        """Start the dedicated Edge by each way in order (remembered winner first) and remember the one that works."""
+        memory = edge_memory_read(self.paths)
+        order = edge_variant_order(memory, self.c.get('edge_original_env'))
+        attempts, winner = [], None
+        for variant in order:
+            if variant['mode'] == 'pipe':
+                result = await self._pipe_attempt(variant)
+            else:
+                result = await self._cdp_attempt(variant)
+            attempts.append(result['summary'])
+            if result['ready']:
+                winner = (variant, result['summary'])
+                break
+            print(f'Way "{variant["label"]}" did not work. Trying the next way.', flush=True)
+        edge_memory_record(self.paths, memory, attempts, winner[0] if winner else None, winner[1] if winner else None)
+        if winner is None:
+            causes = edge_explain_attempts(attempts)
+            print('LIKELY CAUSE (plain English):')
+            for cause in causes:
+                print('  - ' + cause)
+            raise RuntimeError(f'Edge did not start in any of {len(order)} ways. Likely cause: ' + ' '.join(causes)
+                               + ' No profile was deleted and no uncertain submission was repeated. Startup diagnostics are in the logs folder.')
+        variant, summary = winner
+        print(f'Dedicated Edge started using: {variant["label"]}. This choice is remembered for next time.', flush=True)
+        if self.mode == 'cdp':
+            await self.connect()
+
+    async def _cdp_attempt(self, variant):
+        self.last_cdp_summary = None
+
+        def run():
+            self.ensure_started(only=variant)
+            return self.last_cdp_summary
+
+        try:
+            summary = await asyncio.to_thread(run)
+            self.mode = 'cdp'
+            return {'ready': True, 'summary': summary}
+        except Exception as exc:
+            summary = dict(self.last_cdp_summary or {'variant': variant['name'], 'label': variant['label'], 'ready': False,
+                                                     'seconds': None, 'new_edge_processes': 0, 'closed': None, 'assessment': None})
+            summary['error'] = str(exc)[:600]
+            return {'ready': False, 'summary': summary}
+
+    async def _pipe_attempt(self, variant):
+        """Playwright starts the dedicated Edge itself over a private pipe: no debugging port is opened or needed."""
+        started = time.monotonic()
+        summary = {'variant': variant['name'], 'label': variant['label'], 'mode': 'pipe', 'port_argument': None,
+                   'ready': False, 'detected_by': None, 'port': None, 'seconds': None, 'new_edge_processes': 0,
+                   'launcher_exit_code': None, 'assessment': None, 'closed': None}
+        context = None
+        try:
+            await asyncio.to_thread(self._apply_profile_selection)
+            await asyncio.to_thread(self._check_reconciliation)
+            executable = installed_edge(self.c.get('browser_path'), prompt=False)
+            profile = require_s(self.c['profile_dir'], 'Edge profile')
+            profile.mkdir(parents=True, exist_ok=True)
+            write_edge_preferences(self.paths, profile)
+            cache = self.paths['cache'] / 'browser'; cache.mkdir(parents=True, exist_ok=True)
+            env = os.environ.copy()
+            if variant['folders'] == 'normal':
+                for key, value in _ORIGINAL_USER_ENV.items():
+                    if value:
+                        env[key] = value
+                    else:
+                        env.pop(key, None)
+            options = {'user_data_dir': mapped_browser_path(profile), 'headless': os.environ.get('DCR_TEST_HEADLESS') == '1',
+                       'args': [f'--disk-cache-dir={mapped_browser_path(cache)}', f'--crash-dumps-dir={mapped_browser_path(self.paths["crashes"])}',
+                                '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
+                                '--disable-background-timer-throttling', '--disable-component-update', '--disable-breakpad',
+                                '--disable-crash-reporter'],
+                       'env': env, 'timeout': EDGE_PIPE_TIMEOUT_MS, 'accept_downloads': True}
+            if variant['exe'] == 'path':
+                options['executable_path'] = str(executable)
+            else:
+                options['channel'] = 'msedge'
+            context = await self.pw.chromium.launch_persistent_context(**options)
+            page = context.pages[0] if context.pages else await context.new_page()
+            # Two independent checks before this way counts: a page must run script, and the browser must answer a DevTools command.
+            if not await asyncio.wait_for(page.evaluate('() => navigator.userAgent'), 30):
+                raise RuntimeError('The started Edge did not run a page script.')
+            session = await context.new_cdp_session(page)
+            version = await asyncio.wait_for(session.send('Browser.getVersion'), 30)
+            await session.detach()
+            summary.update(ready=True, detected_by='Playwright-started Edge (no debugging port)', seconds=round(time.monotonic() - started, 1),
+                           browser_version=version.get('product'))
+            self.browser = PipeBrowser(context)
+            self.mode = 'pipe'
+            # A stale record of an earlier debugging-port session must not be trusted now.
+            self.marker.unlink(missing_ok=True)
+            return {'ready': True, 'summary': summary}
+        except Exception as exc:
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+            summary.update(seconds=round(time.monotonic() - started, 1), error=str(exc)[:600],
+                           assessment={'playwright_error': str(exc)[:600]},
+                           closed={'terminated': {}, 'note': 'Playwright closed its own browser for this way.'})
+            return {'ready': False, 'summary': summary}
+
+    def _ensure_started_once(self, only=None):
         profile = require_s(self.c['profile_dir'], 'Edge profile')
         profile.mkdir(parents=True, exist_ok=True)
         marker = read_json(self.marker, {})
@@ -2762,15 +2910,12 @@ class EdgeBrowser:
             installed_edge(marker['executable'])
             return
         executable = installed_edge(self.c.get('browser_path'), prompt=True)
-        preferences = profile / 'Default' / 'Preferences'
-        if not preferences.exists():
-            atomic_json(preferences, {'download': {'default_directory': mapped_browser_path(self.paths['downloads']), 'prompt_for_download': False},
-                                      'savefile': {'default_directory': mapped_browser_path(self.paths['downloads'])}})
+        write_edge_preferences(self.paths, profile)
         cache = self.paths['cache'] / 'browser'; cache.mkdir(parents=True, exist_ok=True)
         diagnostic = self.paths['logs'] / ('edge-startup-' + uuid.uuid4().hex + '.json')
         stderr_path = diagnostic.with_suffix('.stderr.log')
         memory = edge_memory_read(self.paths)
-        variants = edge_variant_order(memory, self.c.get('edge_original_env'))
+        variants = [only] if only else edge_cdp_variants(edge_variant_order(memory, self.c.get('edge_original_env')))
         report = {'created': now(), 'endpoint': self.endpoint, 'profile': str(profile),
                   'executable': str(executable), 'edge_version': diag_edge_version(executable),
                   'policies': edge_policy_snapshot(), 'status': 'preflight', 'stderr_log': str(stderr_path),
@@ -2815,7 +2960,7 @@ class EdgeBrowser:
                 print(f'Attempt {number} did not open a debugging port. Trying the next way.')
             if winner:
                 variant, attempt = winner
-                edge_memory_record(self.paths, memory, report['attempts'], variant, attempt)
+                self.last_cdp_summary = attempt['summary']
                 report.update(status='endpoint_ready', winner=variant['name'], detected_by=attempt['detected_by'])
                 atomic_json(diagnostic, report)
                 print(f'Edge debug port found by "{attempt["detected_by"]}" using: {variant["label"]}. This choice is remembered for next time.')
@@ -2823,7 +2968,7 @@ class EdgeBrowser:
                     recorder.event('edge', 'Edge debug endpoint is ready', winner=variant['name'], detected_by=attempt['detected_by'])
                     recorder.snapshot('after_ready', port=self.c['port'], profile=profile, light=True)
                 return
-            edge_memory_record(self.paths, memory, report['attempts'], None, None)
+            self.last_cdp_summary = report['attempts'][-1] if report['attempts'] else None
             causes = edge_explain_attempts(report['attempts'])
             report.update(likely_cause=causes)
             atomic_json(diagnostic, report)
@@ -2946,7 +3091,7 @@ class EdgeBrowser:
         load_playwright()
         self.manager = async_playwright()
         self.pw = await self.manager.start()
-        await self.connect()
+        await self.start()
         return self
 
     async def __aexit__(self, *args):
@@ -2955,6 +3100,10 @@ class EdgeBrowser:
 
     async def connect(self):
         async with self.connection_lock:
+            if self.mode == 'pipe':
+                if self.browser and self.browser.is_connected():
+                    return
+                raise UncertainOperation('The dedicated Edge window was closed during the run. Check the Copilot chats before running again; uncertain sends are kept and never repeated.')
             if self.browser and self.browser.is_connected():
                 return
             last = None
@@ -3606,7 +3755,6 @@ async def execute_simple(args, paths):
         return 2
     print('REAL REVIEW: all eligible cases will be sent, one case per chat. Keep the dedicated Edge window open.')
     print('Sign in there if needed. No old browser session will be copied.', flush=True)
-    browser.ensure_started()
     async with browser:
         # Only the clean landing page from this verified dedicated session may be
         # adopted. No conversation tab is selected by index or by title.

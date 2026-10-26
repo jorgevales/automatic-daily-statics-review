@@ -112,19 +112,21 @@ class EdgeMemoryTests(unittest.TestCase):
             paths = {'home': Path(folder)}
             memory = runner.edge_memory_read(paths)
             self.assertEqual([v['name'] for v in runner.edge_variant_order(memory)],
-                             ['configured-port', 'normal-windows-folders', 'automatic-port'])
-            attempts = [{'variant': 'configured-port', 'label': 'a', 'ready': False},
-                        {'variant': 'normal-windows-folders', 'label': 'b', 'ready': True}]
-            winner = runner.EDGE_VARIANTS[1]
+                             ['pipe-installed-edge', 'pipe-edge-channel', 'pipe-normal-folders',
+                              'configured-port', 'normal-windows-folders', 'automatic-port'])
+            attempts = [{'variant': 'pipe-installed-edge', 'label': 'a', 'ready': False},
+                        {'variant': 'configured-port', 'label': 'b', 'ready': True}]
+            winner = next(v for v in runner.EDGE_VARIANTS if v['name'] == 'configured-port')
             runner.edge_memory_record(paths, memory, attempts, winner, {'detected_by': 'listening port owned by new Edge', 'port': 9100})
             memory = runner.edge_memory_read(paths)
-            self.assertEqual(memory['winner'], 'normal-windows-folders')
-            self.assertEqual(memory['history']['configured-port'], {'ok': 0, 'failed': 1})
-            self.assertEqual([v['name'] for v in runner.edge_variant_order(memory)][0], 'normal-windows-folders')
+            self.assertEqual(memory['winner'], 'configured-port')
+            self.assertEqual(memory['history']['pipe-installed-edge'], {'ok': 0, 'failed': 1})
+            self.assertEqual([v['name'] for v in runner.edge_variant_order(memory)][0], 'configured-port')
+            self.assertEqual([v['name'] for v in runner.edge_cdp_variants(runner.edge_variant_order(memory))][0], 'configured-port')
 
     def test_forced_test_mode_uses_only_normal_folders(self):
         names = [v['name'] for v in runner.edge_variant_order({}, forced_normal_folders=True)]
-        self.assertEqual(names, ['normal-windows-folders'])
+        self.assertEqual(names, ['pipe-normal-folders', 'normal-windows-folders'])
 
     def test_refusal_message_is_explained(self):
         attempts = [{'variant': 'configured-port', 'label': 'configured', 'seconds': 50, 'new_edge_processes': 3,

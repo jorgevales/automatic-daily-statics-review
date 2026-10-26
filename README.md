@@ -41,10 +41,16 @@ The terminal also prints the likely cause in plain English.
 ## Edge startup notes
 
 * The dedicated Edge uses port 9237 by default and never touches other Edge debugging sessions (for example on 9223).
-* Edge is started in up to three ways, one after another (one dedicated profile can run only one Edge at a time):
-  1. configured port, S: folders
-  2. configured port, your normal Windows folders
-  3. automatic port, S: folders
+* Edge is started in up to six ways, one after another (one dedicated profile can run only one Edge at a time).
+  The first three do not use a debugging port at all, because Playwright starts Edge itself over a private pipe:
+  1. Playwright-started Edge, installed Edge file, S: folders
+  2. Playwright-started Edge, Edge channel, S: folders
+  3. Playwright-started Edge, installed Edge file, your normal Windows folders
+  If none of those work, the older debugging-port ways are tried:
+  4. debugging port, S: folders
+  5. debugging port, your normal Windows folders
+  6. automatic debugging port, S: folders
+* A Playwright-started Edge is closed when the run ends. Your sign-in is kept in the dedicated S: profile.
 * While each way is tried, every way of finding the debug port runs at once (the configured port, the port Edge writes
   into the profile, and any port opened by the Edge started in that attempt).
 * The way that works is saved in `edge-startup-memory.json` in the user's S: runtime folder and tried first next time.
