@@ -862,6 +862,22 @@ def identity_key(environ=None):
         raise RuntimeError('Windows user/machine identity is unavailable; refusing a shared browser profile.')
     return hashlib.sha256('\0'.join(x.casefold() for x in parts).encode('utf-8')).hexdigest()[:32]
 
+def s_spelling(value):
+    """Return the same S: location spelled as S:\\..., never the long resolved network path."""
+    path = Path(display_path(value))
+    if _S_ROOT is None:
+        return path
+    try:
+        return Path('S:/') / path.resolve().relative_to(_S_ROOT)
+    except ValueError:
+        return path
+
+
+# Windows limit for a full path is 260 characters. The longest file in the Playwright package is 98
+# characters below its folder, so the install folder must leave room for that plus a safety margin.
+PACKAGE_LONGEST_RELATIVE = 108
+WINDOWS_PATH_BUDGET = 250
+
 def child_executable(executable, argv):
     """Resolve the executable when Windows reports None in the Popen audit event.
 
@@ -985,7 +1001,7 @@ def configure_node_trust():
         os.environ.pop('NODE_EXTRA_CA_CERTS', None)
 
 def initialise():
-    global _S_ROOT, _LAYOUT
+    global _S_ROOT, _LAYOUT, PACKAGE, ENTRY, PYTHON, NODE, RUNTIME_ROOT
     if _LAYOUT is not None:
         return _LAYOUT
     if os.name != 'nt':
@@ -997,7 +1013,11 @@ def initialise():
     expected = require_s(PYTHON, 'Required Python executable')
     if not expected.is_file() or Path(sys.executable).resolve() != expected:
         raise RuntimeError(f'Use only the specified Python executable: {PYTHON}')
-    home = require_s(RUNTIME_ROOT / 'users' / identity_key(), 'User runtime')
+    # Use the short S: spelling everywhere. resolve() on a mapped drive returns the long network
+    # path, which pushes package files past the Windows 260-character limit.
+    PACKAGE, ENTRY = s_spelling(PACKAGE), s_spelling(ENTRY)
+    PYTHON, NODE, RUNTIME_ROOT = s_spelling(PYTHON), s_spelling(NODE), s_spelling(RUNTIME_ROOT)
+    home = s_spelling(require_s(RUNTIME_ROOT / 'users' / identity_key(), 'User runtime'))
     abi = sys.implementation.cache_tag or ('python-' + str(sys.version_info[:2]))
     paths = {
         'home': home,
@@ -1011,7 +1031,7 @@ def initialise():
         'runs': home / 'runs',
         'coordination': RUNTIME_ROOT / 'coordination',
         'logs': home / 'logs',
-        'deps': home / 'dependencies' / abi,
+        'deps': home / 'py' / abi,
         'userprofile': home / 'WindowsProfile',
         'appdata': home / 'AppData' / 'Roaming',
         'localappdata': home / 'AppData' / 'Local',
@@ -1021,9 +1041,7 @@ def initialise():
     }
     for label, path in paths.items():
         require_s(path, label).mkdir(parents=True, exist_ok=True)
-    # Windows stops at about 260 characters. The S: spelling is much shorter than the resolved network
-    # name, and the deep Playwright package files do not fit otherwise (pip: "No such file or directory").
-    paths = {label: Path('S:/') / require_s(path, label).relative_to(_S_ROOT) for label, path in paths.items()}
+    paths = {label: s_spelling(require_s(path, label)) for label, path in paths.items()}
     home = paths['home']
     for key, value in {**_ORIGINAL_EDGE_ENV, **_ORIGINAL_USER_ENV}.items():
         os.environ['DCR_ORIGINAL_' + key] = value
@@ -1720,6 +1738,11 @@ def ensure_dependencies(paths, setup=False):
             missing.append(name)
     if missing:
         print('Installing missing Python dependencies on S: only: ' + ', '.join(missing))
+        needed = len(str(paths['deps'])) + 1 + PACKAGE_LONGEST_RELATIVE
+        if needed > WINDOWS_PATH_BUDGET:
+            raise RuntimeError(f'The working folder is too long for Windows ({needed} characters needed, limit 260). '
+                               'Choose a shorter working folder on S: and run again. The tool will ask for it again '
+                               'after you delete local_paths.cmd.')
         bootstrap_pip()
         child('--pip-internal', ['--isolated', '--disable-pip-version-check', 'install', '--only-binary=:all:',
               '--no-user', '--no-compile', '--no-warn-script-location', '--target', paths['deps'],
