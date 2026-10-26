@@ -2795,10 +2795,7 @@ class EdgeBrowser:
                 if not isinstance(record, dict) or record.get('state') not in {'discovered', 'ready', 'blocked', 'retryable failure', 'completed'} or (record.get('state') != 'completed' and record.get('assignment')):
                     raise RuntimeError('Original browser endpoint unavailable with an unresolved case. Preserve the original session; no new profile or relaunch was attempted.')
 
-    async def start(self):
-        """Start the dedicated Edge by each way in order (remembered winner first) and remember the one that works."""
-        memory = edge_memory_read(self.paths)
-        order = edge_variant_order(memory, self.c.get('edge_original_env'))
+    async def _run_ways(self, order, memory):
         attempts, winner = [], None
         for variant in order:
             if variant['mode'] == 'pipe':
@@ -2810,14 +2807,38 @@ class EdgeBrowser:
                 winner = (variant, result['summary'])
                 break
             print(f'Way "{variant["label"]}" did not work. Trying the next way.', flush=True)
+        return attempts, winner
+
+    async def start(self):
+        """Start the dedicated Edge by each way in order (remembered winner first) and remember the one that works."""
+        memory = edge_memory_read(self.paths)
+        order = edge_variant_order(memory, self.c.get('edge_original_env'))
+        attempts, winner = await self._run_ways(order, memory)
+        if winner is None and sys.stdin.isatty():
+            # The one thing only the user can supply: where Edge is installed on this computer.
+            print('', flush=True)
+            print('Edge did not start. If Microsoft Edge is installed in a different folder on this computer,', flush=True)
+            print('paste the full path of its msedge.exe file below and this tool will try once more.', flush=True)
+            while True:
+                answer = input('Full path of msedge.exe (press Enter alone to stop): ').strip().strip('"')
+                if not answer:
+                    break
+                try:
+                    self.c['browser_path'] = str(installed_edge(answer))
+                except Exception as exc:
+                    print('That file cannot be used: ' + str(exc) + '. Try again, or press Enter to stop.', flush=True)
+                    continue
+                retry_attempts, winner = await self._run_ways(order, memory)
+                attempts += retry_attempts
+                break
         edge_memory_record(self.paths, memory, attempts, winner[0] if winner else None, winner[1] if winner else None)
         if winner is None:
             causes = edge_explain_attempts(attempts)
             print('LIKELY CAUSE (plain English):')
             for cause in causes:
                 print('  - ' + cause)
-            raise RuntimeError(f'Edge did not start in any of {len(order)} ways. Likely cause: ' + ' '.join(causes)
-                               + ' No profile was deleted and no uncertain submission was repeated. Startup diagnostics are in the logs folder.')
+            raise RuntimeError(f'Edge did not start in any of {len(attempts)} ways. Likely cause: ' + ' '.join(causes)
+                               + ' No profile was deleted and no uncertain submission was repeated. Send the EXTERNAL report from the logs folder.')
         variant, summary = winner
         print(f'Dedicated Edge started using: {variant["label"]}. This choice is remembered for next time.', flush=True)
         if self.mode == 'cdp':
