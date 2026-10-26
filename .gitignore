@@ -1,0 +1,20 @@
+# Machine-specific answers (S: paths) - never commit
+local_paths.cmd
+
+# Your review instructions and base message may contain internal wording.
+# Copy them next to the runner on the VDI by hand; they are not pushed.
+daily_review_instructions.md
+daily_review_base_message.md
+instructions.md
+base_message.md
+
+# Runtime output and reports
+*.log
+diagnose/
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Original sanitized source copies (kept locally for reference only)
+context_files/
